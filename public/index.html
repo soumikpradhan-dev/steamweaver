@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>StreamWeaver | High-Throughput No-Code ETL Pipeline</title>
+  <!-- Tailwind CSS & React & Babel for zero-build-step standalone execution -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              100: '#e0e7ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+              900: '#312e81'
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+    body { font-family: 'Plus Jakarta Sans', sans-serif; }
+    code, pre, .font-mono { font-family: 'JetBrains Mono', monospace; }
+    .custom-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+    .custom-scroll::-webkit-scrollbar-track { background: #0f172a; }
+    .custom-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // --- STREAMWEAVER APP ---
+    function App() {
+      // Global State
+      const [files, setFiles] = useState([]);
+      const [selectedFile, setSelectedFile] = useState(null);
+      const [previewData, setPreviewData] = useState(null);
+      const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+      
+      // ETL Config State
+      const [mappings, setMappings] = useState([]);
+      const [transformCode, setTransformCode] = useState(
+`// User-defined transformation in isolated V8 sandbox
+// Input: 'row' (read-only copy), helpers
+if (row.customer_name) {
+  row.customer_name = row.customer_name.toUpperCase();
+}
+if (row.email) {
+  row.email = row.email.toLowerCase().trim();
+}
+if (row.amount) {
+  row.amount = Math.round(Number(row.amount) * 1.0825 * 100) / 100; // Apply 8.25% tax
+}
+return row;`
+      );
+      const [batchSize, setBatchSize] = useState(1000);
+      const [destination, setDestination] = useState('sqlite'); // 'sqlite' | 'mongodb' | 'ndjson'
+      const [mongoConfig, setMongoConfig] = useState({
+        uri: 'mongodb://127.0.0.1:27017',
+        dbName: 'streamweaver',
+        collectionName: 'transformed_records'
+      });
+
+      // Pipeline Telemetry State
+      const [pipelineId, setPipelineId] = useState(null);
+      const [pipelineStatus, setPipelineStatus] = useState('idle'); // 'idle' | 'running' | 'completed' | 'error' | 'aborted'
+      const [metrics, setMetrics] = useState({
+        processedRows: 0,
+        quarantinedRows: 0,
+        committedRows: 0,
+        totalBatches: 0,
+        progressPct: 0,
+        throughput: 0,
+        elapsedSeconds: 0,
+        etaSeconds: 0,
+        memory: { heapUsedMb: 0, heapTotalMb: 0, rssMb: 0, peakMemoryMb: 0 }
+      });
+      const [quarantinedLogs, setQuarantinedLogs] = useState([]);
+      const [testResult, setTestResult] = useState(null);
+      const [isTestingTransform, setIsTestingTransform] = useState(false);
+
+      // Fetch uploaded files
+      const loadFiles = async () => {
+        try {
+          const res = await fetch('/api/upload/files');
+          const data = await res.json();
+          if (data.success) {
+            setFiles(data.files);
+            if (data.files.length > 0 && !selectedFile) {
+              selectFile(data.files[0].id);
+            }
+          }
+        } catch (err) {
+          console.error('Failed to load files:', err);
+        }
+      };
+
+      useEffect(() => {
+        loadFiles();
+      }, []);
+
+      // Select and load preview
+      const selectFile = async (fileId) => {
+        setSelectedFile(fileId);
+        setIsLoadingPreview(true);
+        try {
+          const res = await fetch(`/api/preview/${encodeURIComponent(fileId)}?limit=100`);
+          const data = await res.json();
+          if (data.success) {
+            setPreviewData(data);
+            // Initialize mapping schema from headers
+            const initialMappings = data.headers.map(h => ({
+              source: h,
+              target: h.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase(),
+              type: guessType(h, data.previewRows),
+              include: true
+            }));
+            setMappings(initialMappings);
+          }
+        } catch (err) {
+          console.error('Failed to load preview:', err);
+        } finally {
+          setIsLoadingPreview(false);
+        }
+      };
+
+      const guessType = (header, sampleRows) => {
+        if (!sampleRows || sampleRows.length === 0) return 'string';
+        const val = sampleRows[0][header];
+        if (val === undefined || val === '') return 'string';
+        if (!isNaN(Number(val))) return 'number';
+        if (val === 'true' || val === 'false') return 'boolean';
+        if (!isNaN(Date.parse(val)) && (val.includes('-') || val.includes('/'))) return 'date';
+        return 'string';
+      };
+
+      // Generate synthetic dataset
+      const handleGenerateDataset = async (rows) => {
+        try {
+          const res = await fetch('/api/upload/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rows, format: 'csv' })
+          });
+          const data = await res.json();
+          if (data.success) {
+            await loadFiles();
+            selectFile(data.fileId);
+          }
+        } catch (err) {
+          alert('Generation failed: ' + err.message);
+        }
+      };
+
+      // Test transformation script in backend sandbox
+      const handleTestTransform = async () => {
+        if (!previewData || previewData.previewRows.length === 0) return;
+        setIsTestingTransform(true);
+        try {
+          // Prepare mapped sample row
+          const sample = { ...previewData.previewRows[0] };
+          const mappedSample = {};
+          mappings.filter(m => m.include).forEach(m => {
+            mappedSample[m.target] = sample[m.source];
+          });
+
+          const res = await fetch('/api/pipeline/test-transform', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ row: mappedSample, code: transformCode })
+          });
+          const data = await res.json();
+          setTestResult(data);
+        } catch (err) {
+          setTestResult({ success: false, error: err.message });
+        } finally {
+          setIsTestingTransform(false);
+        }
+      };
+
+      // Start Streaming Pipeline
+      const handleStartPipeline = async () => {
+        if (!selectedFile) return;
+
+        try {
+          setPipelineStatus('running');
+          setQuarantinedLogs([]);
+          
+          const payload = {
+            fileId: selectedFile,
+            mapping: mappings.filter(m => m.include),
+            transformCode,
+            batchSize: Number(batchSize),
+            destination,
+            mongo: destination === 'mongodb' ? mongoConfig : null,
+            estimatedTotalRows: previewData?.estimatedTotalRows || 0
+          };
+
+          const res = await fetch('/api/pipeline/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+
+          if (!data.success) {
+            throw new Error(data.error);
+          }
+
+          setPipelineId(data.pipelineId);
+          listenToSSE(data.pipelineId);
+        } catch (err) {
+          setPipelineStatus('error');
+          alert('Failed to start pipeline: ' + err.message);
+        }
+      };
+
+      // Abort Pipeline
+      const handleAbortPipeline = async () => {
+        if (!pipelineId) return;
+        try {
+          await fetch(`/api/pipeline/abort/${pipelineId}`, { method: 'POST' });
+          setPipelineStatus('aborted');
+        } catch (err) {
+          console.error(err);
+        }
+      };
+
+      // SSE Telemetry Listener
+      const listenToSSE = (id) => {
+        const eventSource = new EventSource(`/api/pipeline/stream/${id}`);
+
+        eventSource.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'metrics') {
+              setMetrics(msg.data);
+            } else if (msg.type === 'quarantine') {
+              setQuarantinedLogs(prev => [msg.data, ...prev].slice(0, 50));
+            } else if (msg.type === 'done') {
+              setPipelineStatus('completed');
+              eventSource.close();
+            } else if (msg.type === 'error') {
+              setPipelineStatus('error');
+              eventSource.close();
+            }
+          } catch (err) {
+            console.error('SSE parse error:', err);
+          }
+        };
+
+        eventSource.onerror = () => {
+          eventSource.close();
+        };
+      };
+
+      // Recipe button handlers
+      const applyRecipe = (recipeType) => {
+        switch (recipeType) {
+          case 'capitalize':
+            setTransformCode(`// Capitalize customer name & trim whitespace\nif (row.customer_name) {\n  row.customer_name = row.customer_name.toUpperCase().trim();\n}\nreturn row;`);
+            break;
+          case 'email_normalize':
+            setTransformCode(`// Lowercase and sanitize email\nif (row.email) {\n  row.email = row.email.toLowerCase().replace(/\\s+/g, '');\n}\nreturn row;`);
+            break;
+          case 'tax_calc':
+            setTransformCode(`// Compute total amount with 8.25% sales tax\nconst subtotal = Number(row.amount || 0);\nrow.tax_amount = Math.round(subtotal * 0.0825 * 100) / 100;\nrow.total_with_tax = Math.round((subtotal + row.tax_amount) * 100) / 100;\nreturn row;`);
+            break;
+          case 'phone_clean':
+            setTransformCode(`// Strip non-numeric characters from phone numbers\nif (row.phone) {\n  row.phone = String(row.phone).replace(/\\D/g, '');\n}\nreturn row;`);
+            break;
+          case 'anonymize':
+            setTransformCode(`// Anonymize sensitive fields\nif (row.email) {\n  const [user, domain] = row.email.split('@');\n  row.email = user.slice(0, 2) + '***@' + (domain || 'anon.com');\n}\nreturn row;`);
+            break;
+        }
+      };
+
+      return (
+        <div className="flex flex-col min-h-screen">
+          {/* Top Navigation */}
+          <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+            <div className="max-w-7xl mx-auto px-4 h-16 flex items-center justify-between">
+              <div className="flex items-center space-x-3">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center font-black text-xl shadow-lg shadow-indigo-500/25">
+                  SW
+                </div>
+                <div>
+                  <h1 className="text-lg font-bold tracking-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent">
+                    StreamWeaver
+                  </h1>
+                  <p className="text-xs text-indigo-400 font-medium">High-Throughput No-Code ETL Pipeline</p>
+                </div>
+              </div>
+
+              {/* Status & Engine Badge */}
+              <div className="flex items-center space-x-4">
+                <div className="hidden md:flex items-center space-x-2 text-xs bg-slate-800/80 border border-slate-700/80 rounded-full px-3 py-1 text-slate-300">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+                  <span>V8 Streams: Native Pipe</span>
+                  <span className="text-slate-600">|</span>
+                  <span>Sandbox: isolated-vm</span>
+                  <span className="text-slate-600">|</span>
+                  <span>Sink: bulkWrite(1000)</span>
+                </div>
+
+                {pipelineStatus === 'running' && (
+                  <button
+                    onClick={handleAbortPipeline}
+                    className="px-3 py-1 text-xs font-semibold rounded-lg bg-rose-500/20 text-rose-300 border border-rose-500/30 hover:bg-rose-500/30 transition"
+                  >
+                    Abort Pipeline
+                  </button>
+                )}
+              </div>
+            </div>
+          </header>
+
+          {/* Main Workspace */}
+          <main className="max-w-7xl mx-auto px-4 py-6 w-full flex-1 space-y-6">
+            
+            {/* 1. Dataset Selector & Synthetic Generator */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 mb-1">
+                    1. Source Dataset Selection
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Process multi-gigabyte CSV or JSON files without exhausting Node.js heap memory limits.
+                  </p>
+                </div>
+
+                {/* Generator quick actions */}
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-slate-400 font-medium">Quick Generate:</span>
+                  <button
+                    onClick={() => handleGenerateDataset(10000)}
+                    className="px-2.5 py-1 text-xs rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 font-medium transition"
+                  >
+                    10K Rows
+                  </button>
+                  <button
+                    onClick={() => handleGenerateDataset(100000)}
+                    className="px-2.5 py-1 text-xs rounded-lg bg-indigo-900/60 hover:bg-indigo-800/80 border border-indigo-700 text-indigo-200 font-medium transition"
+                  >
+                    100K Rows (~15MB)
+                  </button>
+                  <button
+                    onClick={() => handleGenerateDataset(1000000)}
+                    className="px-2.5 py-1 text-xs rounded-lg bg-indigo-600 hover:bg-indigo-500 font-semibold shadow-md shadow-indigo-600/30 transition"
+                  >
+                    ⚡ 1,000,000 Rows (~150MB)
+                  </button>
+                </div>
+              </div>
+
+              {/* Uploads list or chunked upload */}
+              <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
+                {files.map(file => (
+                  <div
+                    key={file.id}
+                    onClick={() => selectFile(file.id)}
+                    className={`cursor-pointer rounded-xl p-3 border transition flex flex-col justify-between ${
+                      selectedFile === file.id
+                        ? 'bg-indigo-950/40 border-indigo-500 ring-2 ring-indigo-500/20'
+                        : 'bg-slate-950 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="truncate font-semibold text-xs text-slate-200">{file.name}</div>
+                    <div className="mt-2 flex items-center justify-between text-[11px] text-slate-400">
+                      <span className="font-mono">{file.sizeMb} MB</span>
+                      <span>{new Date(file.modifiedAt).toLocaleTimeString()}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* 2. Virtualized Preview Grid */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
+                    2. Streamed Preview Grid (Virtualization)
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    First 100 rows sampled via stream transform. Total Estimated Rows: <span className="font-mono text-indigo-400 font-bold">{previewData?.estimatedTotalRows?.toLocaleString() || '0'}</span>
+                  </p>
+                </div>
+                {isLoadingPreview && (
+                  <span className="text-xs text-indigo-400 animate-pulse">Streaming preview sample...</span>
+                )}
+              </div>
+
+              {previewData && previewData.previewRows.length > 0 ? (
+                <VirtualTable
+                  headers={previewData.headers}
+                  rows={previewData.previewRows}
+                />
+              ) : (
+                <div className="h-40 rounded-xl bg-slate-950 border border-slate-800/80 flex items-center justify-center text-slate-500 text-sm">
+                  Select or generate a dataset above to preview
+                </div>
+              )}
+            </div>
+
+            {/* 3. Visual Schema Mapping & isolated-vm Transformation Sandbox */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              
+              {/* Visual Schema Mapper (5 Cols) */}
+              <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
+                      3. Visual Column Mapping
+                    </h2>
+                    <span className="text-[11px] text-slate-400">{mappings.length} columns detected</span>
+                  </div>
+                  <p className="text-xs text-slate-400 mb-4">
+                    Map raw CSV fields to destination schema and apply strict data type casting.
+                  </p>
+
+                  <div className="space-y-2.5 max-h-[380px] overflow-y-auto pr-1 custom-scroll">
+                    {mappings.map((map, idx) => (
+                      <div key={idx} className="bg-slate-950 border border-slate-800/80 rounded-xl p-2.5 flex items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={map.include}
+                          onChange={(e) => {
+                            const next = [...mappings];
+                            next[idx].include = e.target.checked;
+                            setMappings(next);
+                          }}
+                          className="rounded border-slate-700 text-indigo-600 focus:ring-0 cursor-pointer"
+                        />
+                        <div className="w-1/3 truncate text-xs font-mono text-slate-300" title={map.source}>
+                          {map.source}
+                        </div>
+                        <span className="text-slate-600 text-xs">➔</span>
+                        <input
+                          type="text"
+                          value={map.target}
+                          onChange={(e) => {
+                            const next = [...mappings];
+                            next[idx].target = e.target.value;
+                            setMappings(next);
+                          }}
+                          className="w-1/3 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-indigo-300 font-mono focus:border-indigo-500 focus:outline-none"
+                        />
+                        <select
+                          value={map.type}
+                          onChange={(e) => {
+                            const next = [...mappings];
+                            next[idx].type = e.target.value;
+                            setMappings(next);
+                          }}
+                          className="w-1/4 bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-[11px] text-slate-300 focus:outline-none"
+                        >
+                          <option value="string">String</option>
+                          <option value="number">Number</option>
+                          <option value="integer">Integer</option>
+                          <option value="float">Float</option>
+                          <option value="boolean">Boolean</option>
+                          <option value="date">Date</option>
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Target Database Selection */}
+                <div className="mt-4 pt-4 border-t border-slate-800">
+                  <div className="text-xs font-bold uppercase text-slate-400 mb-2">Target Storage Sink</div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <button
+                      onClick={() => setDestination('sqlite')}
+                      className={`px-3 py-2 rounded-xl text-xs font-semibold border text-center transition ${
+                        destination === 'sqlite'
+                          ? 'bg-indigo-600 border-indigo-500 text-white shadow-md shadow-indigo-600/30'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      Native SQLite
+                    </button>
+                    <button
+                      onClick={() => setDestination('mongodb')}
+                      className={`px-3 py-2 rounded-xl text-xs font-semibold border text-center transition ${
+                        destination === 'mongodb'
+                          ? 'bg-emerald-600 border-emerald-500 text-white shadow-md shadow-emerald-600/30'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      MongoDB bulkWrite
+                    </button>
+                    <button
+                      onClick={() => setDestination('ndjson')}
+                      className={`px-3 py-2 rounded-xl text-xs font-semibold border text-center transition ${
+                        destination === 'ndjson'
+                          ? 'bg-amber-600 border-amber-500 text-white shadow-md shadow-amber-600/30'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                      }`}
+                    >
+                      NDJSON Bulk File
+                    </button>
+                  </div>
+                  {destination === 'mongodb' && (
+                    <div className="mt-3 p-2.5 rounded-lg bg-slate-950 border border-slate-800 space-y-2">
+                      <input
+                        type="text"
+                        value={mongoConfig.uri}
+                        onChange={e => setMongoConfig({ ...mongoConfig, uri: e.target.value })}
+                        placeholder="mongodb://localhost:27017"
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 font-mono"
+                      />
+                      <div className="grid grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={mongoConfig.dbName}
+                          onChange={e => setMongoConfig({ ...mongoConfig, dbName: e.target.value })}
+                          placeholder="DB Name"
+                          className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 font-mono"
+                        />
+                        <input
+                          type="text"
+                          value={mongoConfig.collectionName}
+                          onChange={e => setMongoConfig({ ...mongoConfig, collectionName: e.target.value })}
+                          placeholder="Collection"
+                          className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 font-mono"
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Secure Sandbox Transformation Editor (7 Cols) */}
+              <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl flex flex-col justify-between">
+                <div>
+                  <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center space-x-2">
+                      <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400">
+                        4. Secure V8 Transformation Sandbox
+                      </h2>
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                        isolated-vm / V8
+                      </span>
+                    </div>
+                    
+                    <button
+                      onClick={handleTestTransform}
+                      disabled={isTestingTransform}
+                      className="px-3 py-1 text-xs font-semibold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white shadow-md shadow-emerald-600/20 transition flex items-center space-x-1"
+                    >
+                      <span>▶</span>
+                      <span>{isTestingTransform ? 'Testing...' : 'Test Row 1 in Sandbox'}</span>
+                    </button>
+                  </div>
+
+                  {/* Quick transformation recipe templates */}
+                  <div className="flex flex-wrap items-center gap-1.5 mb-3">
+                    <span className="text-[11px] text-slate-400 font-medium">Quick Recipes:</span>
+                    <button onClick={() => applyRecipe('capitalize')} className="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300">
+                      Capitalize Name
+                    </button>
+                    <button onClick={() => applyRecipe('email_normalize')} className="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300">
+                      Normalize Email
+                    </button>
+                    <button onClick={() => applyRecipe('tax_calc')} className="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300">
+                      Compute Tax (+8.25%)
+                    </button>
+                    <button onClick={() => applyRecipe('phone_clean')} className="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300">
+                      Clean Phone
+                    </button>
+                    <button onClick={() => applyRecipe('anonymize')} className="px-2 py-0.5 text-[11px] rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300">
+                      Mask PII
+                    </button>
+                  </div>
+
+                  {/* Code Editor */}
+                  <div className="relative rounded-xl border border-slate-800 overflow-hidden bg-slate-950">
+                    <div className="px-3 py-1.5 bg-slate-950 border-b border-slate-800 flex items-center justify-between text-xs text-slate-400 font-mono">
+                      <span>function transform(row, helpers) &#123;</span>
+                      <span className="text-[10px] text-slate-400">Timeout: 50ms | Memory: 16MB</span>
+                    </div>
+                    <textarea
+                      value={transformCode}
+                      onChange={(e) => setTransformCode(e.target.value)}
+                      rows={8}
+                      className="w-full bg-slate-950 p-3 text-xs font-mono text-emerald-300 focus:outline-none custom-scroll resize-none"
+                      spellCheck="false"
+                    />
+                    <div className="px-3 py-1 bg-slate-950 border-t border-slate-800 text-xs text-slate-400 font-mono">
+                      &#125;
+                    </div>
+                  </div>
+
+                  {/* Sandbox Test Output Display */}
+                  {testResult && (
+                    <div className="mt-3 p-3 rounded-xl bg-slate-950 border border-slate-800 text-xs font-mono">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-bold text-slate-400">
+                          {testResult.success ? '✅ Sandbox Execution Passed' : '❌ Sandbox Error'}
+                        </span>
+                        {testResult.executionTimeMs !== undefined && (
+                          <span className="text-slate-400 text-[10px]">
+                            {testResult.executionTimeMs} ms ({testResult.engine})
+                          </span>
+                        )}
+                      </div>
+                      <pre className="text-[11px] text-indigo-300 overflow-x-auto max-h-24 custom-scroll">
+                        {JSON.stringify(testResult.output || testResult.error, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+
+                {/* Batch Size & Launch Pipeline Trigger */}
+                <div className="mt-4 pt-4 border-t border-slate-800 flex items-center justify-between">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-xs text-slate-400 font-medium">bulkWrite Batch:</span>
+                    <select
+                      value={batchSize}
+                      onChange={(e) => setBatchSize(Number(e.target.value))}
+                      className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200"
+                    >
+                      <option value="500">500 docs</option>
+                      <option value="1000">1,000 docs (Optimal)</option>
+                      <option value="2500">2,500 docs</option>
+                      <option value="5000">5,000 docs</option>
+                    </select>
+                  </div>
+
+                  <button
+                    onClick={handleStartPipeline}
+                    disabled={pipelineStatus === 'running'}
+                    className={`px-6 py-2.5 rounded-xl text-sm font-bold shadow-lg transition flex items-center space-x-2 ${
+                      pipelineStatus === 'running'
+                        ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                        : 'bg-gradient-to-r from-indigo-600 via-indigo-500 to-cyan-500 hover:from-indigo-500 hover:to-cyan-400 text-white shadow-indigo-600/30 hover:scale-[1.02]'
+                    }`}
+                  >
+                    <span>⚡</span>
+                    <span>{pipelineStatus === 'running' ? 'Pipeline Active...' : 'Launch Native Stream Pipeline'}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* 4. Live Progress Bar & Memory Telemetry Monitor */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-xl space-y-5">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 mb-0.5">
+                    5. Real-Time Telemetry & Memory Bounded Monitor
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Live Server-Sent Events stream: monitors V8 RSS / Heap stability to prove $O(1)$ memory consumption.
+                  </p>
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  <span className={`px-2.5 py-1 rounded-full text-xs font-bold uppercase ${
+                    pipelineStatus === 'running' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse' :
+                    pipelineStatus === 'completed' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' :
+                    pipelineStatus === 'error' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40' :
+                    'bg-slate-800 text-slate-400 border border-slate-700'
+                  }`}>
+                    Status: {pipelineStatus}
+                  </span>
+                </div>
+              </div>
+
+              {/* Progress Bar */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-300">
+                    Processed: <span className="font-mono text-indigo-400">{metrics.processedRows.toLocaleString()}</span> / {metrics.totalRows ? metrics.totalRows.toLocaleString() : 'Estimating...'} rows
+                  </span>
+                  <span className="font-mono text-indigo-300 font-bold">{metrics.progressPct}%</span>
+                </div>
+                <div className="w-full h-3 rounded-full bg-slate-950 overflow-hidden border border-slate-800">
+                  <div
+                    className="h-full bg-gradient-to-r from-indigo-600 via-indigo-500 to-cyan-400 transition-all duration-200"
+                    style={{ width: `${metrics.progressPct}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Telemetry KPI Cards */}
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] font-bold uppercase text-slate-400">Throughput</div>
+                  <div className="mt-1 font-mono text-xl font-black text-cyan-400">
+                    {metrics.throughput.toLocaleString()} <span className="text-xs text-slate-400 font-normal">rows/s</span>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] font-bold uppercase text-slate-400">Batches Committed</div>
+                  <div className="mt-1 font-mono text-xl font-black text-emerald-400">
+                    {metrics.totalBatches.toLocaleString()} <span className="text-xs text-slate-400 font-normal">({metrics.committedRows.toLocaleString()})</span>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] font-bold uppercase text-slate-400">Heap Used (V8)</div>
+                  <div className="mt-1 font-mono text-xl font-black text-amber-400">
+                    {metrics.memory?.heapUsedMb || 0} <span className="text-xs text-slate-400 font-normal">MB</span>
+                  </div>
+                  <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                    RSS: {metrics.memory?.rssMb || 0} MB
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] font-bold uppercase text-slate-400">Elapsed / ETA</div>
+                  <div className="mt-1 font-mono text-xl font-black text-slate-200">
+                    {metrics.elapsedSeconds}s
+                  </div>
+                  <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                    ETA: {metrics.etaSeconds}s
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                  <div className="text-[11px] font-bold uppercase text-slate-400">Quarantined Errors</div>
+                  <div className="mt-1 font-mono text-xl font-black text-rose-400">
+                    {metrics.quarantinedRows.toLocaleString()}
+                  </div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">
+                    Non-blocking
+                  </div>
+                </div>
+              </div>
+
+              {/* Error Quarantine Log Box */}
+              {quarantinedLogs.length > 0 && (
+                <div className="mt-4 p-3 rounded-xl bg-rose-950/20 border border-rose-900/50">
+                  <div className="flex items-center justify-between text-xs font-bold text-rose-400 mb-2">
+                    <span>⚠️ Quarantined Validation & Sandbox Errors ({quarantinedLogs.length})</span>
+                    <span className="text-[11px] text-slate-400">Safely isolated from database</span>
+                  </div>
+                  <div className="max-h-28 overflow-y-auto font-mono text-[11px] space-y-1.5 custom-scroll">
+                    {quarantinedLogs.map((q, i) => (
+                      <div key={i} className="text-rose-300 bg-slate-950/80 p-1.5 rounded border border-rose-900/30">
+                        <span className="text-slate-400">[{q.timestamp.slice(11, 19)}]</span> {q.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+          </main>
+        </div>
+      );
+    }
+
+    // --- VIRTUAL TABLE COMPONENT ---
+    // High-performance virtualized table: only renders the visible slice of rows
+    function VirtualTable({ headers, rows }) {
+      const rowHeight = 36;
+      const visibleCount = 12;
+      const [scrollTop, setScrollTop] = useState(0);
+
+      const totalHeight = rows.length * rowHeight;
+      const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - 2);
+      const endIndex = Math.min(rows.length, startIndex + visibleCount + 4);
+      const visibleRows = rows.slice(startIndex, endIndex);
+
+      const onScroll = (e) => {
+        setScrollTop(e.target.scrollTop);
+      };
+
+      return (
+        <div className="rounded-xl border border-slate-800 overflow-hidden bg-slate-950">
+          {/* Header Row */}
+          <div className="bg-slate-900 border-b border-slate-800 flex text-xs font-bold text-slate-300">
+            <div className="w-12 px-3 py-2 text-center text-slate-400 font-mono border-r border-slate-800 shrink-0">#</div>
+            {headers.map((h, i) => (
+              <div key={i} className="flex-1 min-w-[150px] px-3 py-2 truncate uppercase tracking-wider font-mono border-r border-slate-800/50 last:border-r-0">
+                {h}
+              </div>
+            ))}
+          </div>
+
+          {/* Virtualized Body Container */}
+          <div
+            onScroll={onScroll}
+            className="overflow-y-auto overflow-x-auto custom-scroll relative"
+            style={{ height: `${visibleCount * rowHeight}px` }}
+          >
+            <div style={{ height: `${totalHeight}px`, position: 'relative' }}>
+              <div style={{ transform: `translateY(${startIndex * rowHeight}px)`, position: 'absolute', left: 0, right: 0 }}>
+                {visibleRows.map((row, idx) => {
+                  const absoluteIndex = startIndex + idx;
+                  return (
+                    <div
+                      key={absoluteIndex}
+                      className={`flex text-xs border-b border-slate-800/40 hover:bg-slate-800/40 transition-colors ${
+                        absoluteIndex % 2 === 0 ? 'bg-slate-950' : 'bg-slate-900/30'
+                      }`}
+                      style={{ height: `${rowHeight}px` }}
+                    >
+                      <div className="w-12 px-3 py-2 text-center text-slate-400 font-mono border-r border-slate-800/40 shrink-0">
+                        {absoluteIndex + 1}
+                      </div>
+                      {headers.map((h, colIdx) => (
+                        <div
+                          key={colIdx}
+                          className="flex-1 min-w-[150px] px-3 py-2 truncate text-slate-300 font-mono border-r border-slate-800/30 last:border-r-0"
+                          title={String(row[h] || '')}
+                        >
+                          {String(row[h] !== undefined ? row[h] : '')}
+                        </div>
+                      ))}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Mount Application
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>

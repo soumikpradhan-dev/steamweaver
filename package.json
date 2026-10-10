@@ -1,0 +1,40 @@
+{
+  "name": "streamweaver",
+  "version": "1.0.0",
+  "description": "High-Throughput No-Code ETL Pipeline with Native Node Streams, V8 Sandbox, MongoDB bulkWrite, and Virtualized Grid",
+  "main": "server/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "benchmark": "node scripts/run_benchmark.js",
+    "benchmark:generate": "node scripts/generate_benchmark_data.js --rows 1000000",
+    "test": "node tests/sandbox.test.js && node tests/pipeline.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "cors": "^2.8.5",
+    "multer": "^1.4.5-lts.1",
+    "csv-parser": "^3.0.0",
+    "mongodb": "^6.10.0"
+  },
+  "optionalDependencies": {
+    "isolated-vm": "^4.7.1"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  },
+  "keywords": [
+    "etl",
+    "stream",
+    "stream-transform",
+    "isolated-vm",
+    "mongodb",
+    "bulkWrite",
+    "virtualized-table",
+    "no-code",
+    "high-throughput"
+  ],
+  "author": "StreamWeaver Engineering Team",
+  "license": "MIT"
+}
